@@ -27,4 +27,4 @@ RUN pip install -r requirements.txt
 EXPOSE 7860
 
 # Comando para ejecutar la aplicación
-CMD ["bash", "start.sh"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
