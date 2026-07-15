@@ -79,6 +79,8 @@ access_denied_log_col.create_index("user_id", unique=True)
 counters_col = db["counters"]
 if counters_col.count_documents({"_id": "pending_seq"}) == 0:
     counters_col.insert_one({"_id": "pending_seq", "seq": 0})
+if counters_col.count_documents({"_id": "user_seq"}) == 0:
+    counters_col.insert_one({"_id": "user_seq", "seq": 0})
 
 api_id = API_ID
 api_hash = API_HASH
@@ -150,6 +152,9 @@ download_worker_task = None
 
 # ======================== ALMACENAMIENTO TEMPORAL PARA CONFIGURACIÓN DE VIDEOS ======================== #
 temp_video_configs = {}
+
+# ======================== NUEVA VARIABLE PARA CONTROL DE TAREAS DE ACTUALIZACIÓN DE COLA ======================== #
+user_queue_tasks = {}  # user_id -> {"chat_id": int, "message_id": int, "task": asyncio.Task}
 
 # ======================== NUEVAS FUNCIONES PARA EL MODO DE COMPRESIÓN ======================== #
 async def get_user_compression_mode(user_id: int) -> str:
@@ -238,7 +243,34 @@ def format_start_time(estimated_start):
             local_time = estimated_start.astimezone(cuba_tz)
             return local_time.strftime("%I:%M %p")
 
-# ======================== FIN NUEVAS FUNCIONES ======================== #
+# ======================== FUNCIONES PARA OBTENER NÚMERO DE USUARIO ======================== #
+def get_next_user_seq():
+    """Obtiene el siguiente número secuencial para un nuevo usuario."""
+    result = counters_col.find_one_and_update(
+        {"_id": "user_seq"},
+        {"$inc": {"seq": 1}},
+        return_document=True
+    )
+    return result["seq"]
+
+def get_user_number(user_id: int):
+    """
+    Retorna el número de usuario almacenado en la base de datos.
+    Si el usuario existe pero no tiene número, se le asigna uno automáticamente.
+    Si no existe, retorna None.
+    """
+    user = users_col.find_one({"user_id": user_id}, {"user_number": 1})
+    if user:
+        if "user_number" in user:
+            return user["user_number"]
+        else:
+            # Asignar número secuencial
+            new_number = get_next_user_seq()
+            users_col.update_one({"user_id": user_id}, {"$set": {"user_number": new_number}})
+            return new_number
+    return None
+
+# ======================== FIN DE NUEVAS FUNCIONES ======================== #
 
 def is_supported_video_file(filename: str) -> bool:
     if not filename:
@@ -331,7 +363,7 @@ def get_resolution_keyboard_video(compression_id, selected_resolution=None):
     nav_buttons.append(InlineKeyboardButton("🔙 Regresar", callback_data=f"vid_back_res_{compression_id}"))
     if selected_resolution:
         nav_buttons.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"vid_next_crf_{compression_id}"))
-    nav_buttons.append(InlineKeyboardButton("❌ Cancelar", callback_data=f"vid_cancel_{compression_id}"))
+    nav_buttons.append(InlineKeyboardButton("⛔ Cancelar ⛔", callback_data=f"vid_cancel_{compression_id}"))
     if nav_buttons:
         buttons.append(nav_buttons)
     return InlineKeyboardMarkup(buttons)
@@ -350,7 +382,7 @@ def get_crf_keyboard_video(compression_id, selected_crf=None):
     nav_buttons = [InlineKeyboardButton("🔙 Atrás", callback_data=f"vid_back_crf_{compression_id}")]
     if selected_crf:
         nav_buttons.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"vid_next_fps_{compression_id}"))
-    nav_buttons.append(InlineKeyboardButton("❌ Cancelar", callback_data=f"vid_cancel_{compression_id}"))
+    nav_buttons.append(InlineKeyboardButton("⛔ Cancelar ⛔", callback_data=f"vid_cancel_{compression_id}"))
     buttons.append(nav_buttons)
     return InlineKeyboardMarkup(buttons)
 
@@ -368,7 +400,7 @@ def get_fps_keyboard_video(compression_id, selected_fps=None):
     nav_buttons = [InlineKeyboardButton("🔙 Atrás", callback_data=f"vid_back_fps_{compression_id}")]
     if selected_fps:
         nav_buttons.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"vid_next_audio_{compression_id}"))
-    nav_buttons.append(InlineKeyboardButton("❌ Cancelar", callback_data=f"vid_cancel_{compression_id}"))
+    nav_buttons.append(InlineKeyboardButton("⛔ Cancelar ⛔", callback_data=f"vid_cancel_{compression_id}"))
     buttons.append(nav_buttons)
     return InlineKeyboardMarkup(buttons)
 
@@ -386,7 +418,7 @@ def get_audio_keyboard_video(compression_id, selected_audio=None):
     nav_buttons = [InlineKeyboardButton("🔙 Atrás", callback_data=f"vid_back_audio_{compression_id}")]
     if selected_audio:
         nav_buttons.append(InlineKeyboardButton("Finalizar ✅", callback_data=f"vid_finish_{compression_id}"))
-    nav_buttons.append(InlineKeyboardButton("❌ Cancelar", callback_data=f"vid_cancel_{compression_id}"))
+    nav_buttons.append(InlineKeyboardButton("⛔ Cancelar ⛔", callback_data=f"vid_cancel_{compression_id}"))
     buttons.append(nav_buttons)
     return InlineKeyboardMarkup(buttons)
 
@@ -601,7 +633,7 @@ async def setdays_command(client, message):
             return
         confirm_keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Confirmar", callback_data=f"confirm_setdays_{days}"),
-             InlineKeyboardButton("❌ Cancelar", callback_data="cancel_setdays")]
+             InlineKeyboardButton("⛔ Cancelar ⛔", callback_data="cancel_setdays")]
         ])
         await message.reply(
             f"⚠️ **¿Estás seguro de que quieres agregar {days} día(s) a TODOS los usuarios?**\n\n"
@@ -939,7 +971,7 @@ async def get_queue_status(user_id=None):
     try:
         active_compr = list(active_compressions_col.find({}))
         downloaded_videos = list(downloaded_videos_col.find().sort("timestamp", 1))
-        pending_queue = list(pending_col.find().sort("seq", 1))  
+        pending_queue = list(pending_col.find().sort("seq", 1))
         active_count = len(active_compr)
         downloaded_count = len(downloaded_videos)
         pending_count = len(pending_queue)
@@ -965,35 +997,37 @@ async def get_queue_status(user_id=None):
                 comp_id = item["compression_id"]
                 file_name = item.get("file_name", "Sin nombre")
                 uid = item["user_id"]
-                try:
-                    user = await app.get_users(uid)
-                    username = f"@{user.username}" if user.username else f"Usuario {uid}"
-                except:
-                    username = f"Usuario {uid}"
+                # Mostrar "Tu*" si el usuario coincide con el que consulta
+                if user_id is not None and uid == user_id:
+                    username_display = "(Tu)"
+                else:
+                    user_number = get_user_number(uid)
+                    username_display = f"Usuario {user_number}" if user_number else f"Usuario {uid}"
                 progress_data = compression_progress.get(comp_id, {})
                 percent = progress_data.get("percent", 0)
                 progress_bar = create_mini_progress_bar(percent)
-                response += f"• {username} ➧ {progress_bar}\n"
+                response += f"» {username_display} ➧ {progress_bar}\n"
         else:
             response += "**• Ninguna**\n"
 
         response += f"\n🗜️**Compresiones activas:** {len(active_compr)}/{max_simultaneous}\n"
         if active_compr:
-            for i, comp in enumerate(active_compr, 1):
+            for comp in active_compr:
                 compression_id = comp.get("compression_id")
                 comp_user_id = comp.get("user_id")
                 file_name = comp.get("file_name", "Sin nombre")
-                try:
-                    user = await app.get_users(comp_user_id)
-                    username = f"@{user.username}" if user.username else f"Usuario {comp_user_id}"
-                except:
-                    username = f"Usuario {comp_user_id}"
+                # Mostrar "Tu*" si el usuario coincide con el que consulta
+                if user_id is not None and comp_user_id == user_id:
+                    username_display = "(Tu)"
+                else:
+                    user_number = get_user_number(comp_user_id)
+                    username_display = f"Usuario {user_number}" if user_number else f"Usuario {comp_user_id}"
                 percent = 0
                 if compression_id in compression_progress:
                     progress_data = compression_progress[compression_id]
                     percent = progress_data.get("percent", 0)
                 progress_bar = create_mini_progress_bar(percent)
-                response += f"{i}. {username} ➧ {progress_bar}\n"
+                response += f"» {username_display} ➧ {progress_bar}\n"
         else:
             response += "**• Ninguno**\n"
 
@@ -1004,12 +1038,13 @@ async def get_queue_status(user_id=None):
                 video_user_id = video.get("user_id")
                 user_video_counts[video_user_id] = user_video_counts.get(video_user_id, 0) + 1
             for i, (video_user_id, count) in enumerate(user_video_counts.items(), 1):
-                try:
-                    user = await app.get_users(video_user_id)
-                    username = f"@{user.username}" if user.username else f"Usuario {video_user_id}"
-                except:
-                    username = f"Usuario {video_user_id}"
-                response += f"{i}. {username} ({count} videos)\n" if count > 1 else f"{i}. {username}\n"
+                # Mostrar "Tu*" si el usuario coincide con el que consulta
+                if user_id is not None and video_user_id == user_id:
+                    username_display = "(Tu)"
+                else:
+                    user_number = get_user_number(video_user_id)
+                    username_display = f"Usuario {user_number}" if user_number else f"Usuario {video_user_id}"
+                response += f"» {i}. {username_display} ({count} videos)\n" if count > 1 else f"» {i}. {username_display}\n"
         else:
             response += "**• Ninguno**\n"
 
@@ -1032,6 +1067,34 @@ async def get_queue_status(user_id=None):
     except Exception as e:
         logger.error(f"❌Error en get_queue_status: {e}")
         return "❌ **Error al obtener el estado de la cola**", None
+
+# ======================== NUEVA FUNCIÓN PARA ACTUALIZACIÓN AUTOMÁTICA DE LA COLA ======================== #
+async def update_queue_loop(chat_id: int, message_id: int, user_id: int):
+    """Bucle que actualiza el mensaje de la cola cada 6 segundos."""
+    try:
+        while True:
+            await asyncio.sleep(6)
+            queue_status, keyboard = await get_queue_status(user_id)
+            try:
+                await app.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=queue_status,
+                    reply_markup=keyboard
+                )
+            except MessageNotModified:
+                pass  # No hubo cambios
+            except Exception as e:
+                logger.error(f"Error actualizando mensaje de cola {message_id}: {e}")
+                break  # Si el mensaje ya no existe, salimos
+    except asyncio.CancelledError:
+        logger.info(f"Tarea de actualización de cola {message_id} cancelada")
+    finally:
+        # Limpiar la entrada del diccionario si aún existe
+        if user_id in user_queue_tasks:
+            data = user_queue_tasks.get(user_id)
+            if data and data.get("message_id") == message_id and data.get("chat_id") == chat_id:
+                del user_queue_tasks[user_id]
 
 @app.on_message(filters.command("cancel") & filters.private)
 async def cancel_command(client, message):
@@ -1480,6 +1543,12 @@ async def set_user_plan(user_id: int, plan: str, notify: bool = True, expires_at
     existing_user = users_col.find_one({"user_id": user_id})
     if not existing_user:
         user_data["join_date"] = datetime.datetime.now()
+        # Asignar número de usuario secuencial
+        user_data["user_number"] = get_next_user_seq()
+    else:
+        # Si el usuario ya existe pero no tiene user_number (por ejemplo, de versiones anteriores), se lo asignamos
+        if "user_number" not in existing_user:
+            user_data["user_number"] = get_next_user_seq()
     await reset_expiry_notification_flags(user_id)
     users_col.update_one({"user_id": user_id}, {"$set": user_data}, upsert=True)
     if notify:
@@ -1678,7 +1747,7 @@ async def update_all_compression_waiting_messages():
 
         text = (
             "╭━━━━[**🤖Compress Fast**]━━━━━╮\n"
-            "┠✅ **Video descargado** ✅\n"
+            "┠📥 **Video descargado**\n"
             f"┠📁 **Archivo:** `{file_name}`\n"
             f"┠📊 **Posición en cola:** {position}\n"
             "┠🔄 **Agregado a la cola de compresión**\n"
@@ -1809,7 +1878,7 @@ async def download_file_immediately_worker(compression_id, user_id, chat_id, ori
 
             completion_text = (
                 "╭━━━━[**🤖Compress Fast**]━━━━━╮\n"
-                "┠✅ **Video descargado** ✅\n"
+                "┠📥 **Video descargado**\n"
                 f"┠📁 **Archivo:** `{file_name}`\n"
                 f"┠📊 **Posición en cola:** #{position}\n"
                 "┠🔄 **Agregado a la cola de compresión**\n"
@@ -2071,7 +2140,7 @@ async def compress_video_from_path(task, start_msg):
             counter += 1
         logger.info(f"✅Ruta de compresión: {compressed_video_path}")
 
-        drawtext_filter = f"drawtext=text='@compresstestbot':x=w-tw-10:y=10:fontsize=20:fontcolor=white"
+        drawtext_filter = f"drawtext=text='@CompressFastBot':x=w-tw-10:y=10:fontsize=20:fontcolor=white"
         ffmpeg_command = [
             'ffmpeg', '-y', '-i', original_video_path,
             '-vf', f"scale={user_video_settings['resolution']},{drawtext_filter}",
@@ -2564,7 +2633,8 @@ async def process_media_file(client, message: Message, file_obj, file_name: str)
         })
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🛠️ Personalizar Calidad 🔧", callback_data=f"config_video_{compression_id}")],
-            [InlineKeyboardButton("❌ Cancelar", callback_data=f"vid_cancel_{compression_id}")]
+            [InlineKeyboardButton("⚙️ Resolucion ⚙️", callback_data=f"select_resolution_{compression_id}")],
+            [InlineKeyboardButton("⛔ Cancelar ⛔", callback_data=f"vid_cancel_{compression_id}")]
         ])
         await send_protected_message(
             message.chat.id,
@@ -2680,6 +2750,7 @@ async def update_payment_status(payment_id: ObjectId, status: str, receipt_photo
 async def delete_payment_request(payment_id: ObjectId):
     pending_payments_col.delete_one({"_id": payment_id})
 
+# ======================== CALLBACK HANDLER MODIFICADO ======================== #
 @app.on_callback_query()
 async def callback_handler(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
@@ -2714,6 +2785,71 @@ async def callback_handler(client, callback_query: CallbackQuery):
         await callback_query.answer()
         return
 
+    # ================== NUEVOS BLOQUES PARA SELECCIÓN RÁPIDA DE RESOLUCIÓN ================== #
+    if data.startswith("select_resolution_"):
+        compression_id = data.split("_")[2]
+        pending_item = pending_col.find_one({"compression_id": compression_id})
+        if not pending_item or pending_item.get("status") != "awaiting_config":
+            await callback_query.answer("⚠️ Este video ya no está disponible.", show_alert=True)
+            return
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("360p", callback_data=f"quick_res_{compression_id}_360")],
+            [InlineKeyboardButton("480p", callback_data=f"quick_res_{compression_id}_480")],
+            [InlineKeyboardButton("720p", callback_data=f"quick_res_{compression_id}_720")],
+            [InlineKeyboardButton("🔙 Volver", callback_data=f"back_to_config_{compression_id}")]
+        ])
+        await callback_query.message.edit_text("🗜️ **Selecciona la calidad para el video**", reply_markup=keyboard)
+        await callback_query.answer()
+        return
+
+    if data.startswith("quick_res_"):
+        parts = data.split("_")
+        compression_id = parts[2]
+        resolution = parts[3]  # '360', '480', '720'
+        # Configuraciones predefinidas
+        configs = {
+            "360": {"resolution": "640x360", "crf": "28", "fps": "20", "audio_bitrate": "64k"},
+            "480": {"resolution": "-2:480", "crf": "30", "fps": "20", "audio_bitrate": "64k"},
+            "720": {"resolution": "-2:720", "crf": "30", "fps": "20", "audio_bitrate": "64k"}
+        }
+        custom_settings = configs.get(resolution)
+        if not custom_settings:
+            await callback_query.answer("❌ Resolución no válida", show_alert=True)
+            return
+        pending_item = pending_col.find_one({"compression_id": compression_id})
+        if not pending_item or pending_item.get("status") != "awaiting_config":
+            await callback_query.answer("⚠️ Este video ya no está disponible.", show_alert=True)
+            return
+        # Encolar con la configuración rápida
+        success = await enqueue_video_for_compression(compression_id, custom_settings)
+        if success:
+            await callback_query.message.edit_text("✅ **Configuración aplicada.**\nEl video se está procesando.")
+            asyncio.create_task(delete_message_after(callback_query.message, 2))
+            await callback_query.answer("✅ Video encolado con calidad rápida.")
+        else:
+            await callback_query.message.edit_text("❌ **Error al procesar el video. Intenta de nuevo.**")
+            await callback_query.answer("Error al encolar.", show_alert=True)
+        return
+
+    if data.startswith("back_to_config_"):
+        compression_id = data.split("_")[3]  # back_to_config_{compression_id}
+        pending_item = pending_col.find_one({"compression_id": compression_id})
+        if not pending_item:
+            await callback_query.answer("⚠️ Este video ya no está disponible.", show_alert=True)
+            return
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛠️ Personalizar Calidad 🔧", callback_data=f"config_video_{compression_id}")],
+            [InlineKeyboardButton("⚙️ Resolucion ⚙️", callback_data=f"select_resolution_{compression_id}")],
+            [InlineKeyboardButton("⛔ Cancelar ⛔", callback_data=f"vid_cancel_{compression_id}")]
+        ])
+        await callback_query.message.edit_text(
+            "🛠️ **Personaliza la calidad de este video**\n\nConfigura la calidad de compresión para este video.\n**Para cambiar de configuración de compresión use /mode**",
+            reply_markup=keyboard
+        )
+        await callback_query.answer()
+        return
+    # ================== FIN DE LOS NUEVOS BLOQUES ================== #
+
     if data.startswith("vid_res_"):
         parts = data.split("_")
         compression_id = parts[2]
@@ -2728,6 +2864,27 @@ async def callback_handler(client, callback_query: CallbackQuery):
         )
         await callback_query.answer()
         return
+
+    # ----- NUEVO MANEJADOR PARA "🔙 Regresar" en el paso de resolución -----
+    if data.startswith("vid_back_res_"):
+        compression_id = data.split("_")[3]  # vid_back_res_{compression_id}
+        pending_item = pending_col.find_one({"compression_id": compression_id})
+        if not pending_item:
+            await callback_query.answer("⚠️ Este video ya no está disponible.", show_alert=True)
+            return
+        # Volver al menú principal de configuración (igual que en "back_to_config_")
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛠️ Personalizar Calidad 🔧", callback_data=f"config_video_{compression_id}")],
+            [InlineKeyboardButton("⚙️ Resolucion ⚙️", callback_data=f"select_resolution_{compression_id}")],
+            [InlineKeyboardButton("⛔ Cancelar ⛔", callback_data=f"vid_cancel_{compression_id}")]
+        ])
+        await callback_query.message.edit_text(
+            "🛠️ **Personaliza la calidad de este video**\n\nConfigura la calidad de compresión para este video.\n**Para cambiar de configuración de compresión use /mode**",
+            reply_markup=keyboard
+        )
+        await callback_query.answer()
+        return
+    # ----------------------------------------------------------
 
     if data.startswith("vid_next_crf_"):
         compression_id = data.split("_")[3]
@@ -2931,10 +3088,10 @@ async def callback_handler(client, callback_query: CallbackQuery):
                     comp_user_id = comp.get("user_id")
                     file_name = comp.get("file_name", "Sin nombre")
                     start_time = comp.get("start_time")
-                    try:
-                        user = await app.get_users(comp_user_id)
-                        username = f"@{user.username}" if user.username else f"Usuario {comp_user_id}"
-                    except:
+                    user_number = get_user_number(comp_user_id)
+                    if user_number:
+                        username = f"Usuario {user_number}"
+                    else:
                         username = f"Usuario {comp_user_id}"
                     start_str = start_time.strftime("%H:%M:%S") if isinstance(start_time, datetime.datetime) else "¿?"
                     response += f"{i}. {username} - `{file_name}` (⏰ {start_str})\n"
@@ -3170,6 +3327,8 @@ async def callback_handler(client, callback_query: CallbackQuery):
             else:
                 await callback_query.answer("⚠️ No se pudo cancelar la tarea", show_alert=True)
         return
+
+    # ========== NUEVO MANEJADOR PARA REFRESH_QUEUE (opcional, ya no necesario pero se conserva) ==========
     if data == "refresh_queue":
         try:
             queue_text, queue_keyboard = await get_queue_status(user_id)
@@ -3179,26 +3338,23 @@ async def callback_handler(client, callback_query: CallbackQuery):
             logger.error(f"❌Error actualizando cola: {e}")
             await callback_query.answer("⏳Procesando información⏳...")
         return
+
+    # ========== NUEVO MANEJADOR PARA CLOSE_QUEUE ==========
     elif data == "close_queue":
         try:
+            # Cancelar la tarea de actualización si existe
+            if user_id in user_queue_tasks:
+                data_task = user_queue_tasks[user_id]
+                data_task["task"].cancel()
+                del user_queue_tasks[user_id]
             await callback_query.message.delete()
-            try:
-                message_id = callback_query.message.id
-                await app.delete_messages(callback_query.message.chat.id, [message_id - 1])
-            except Exception as e:
-                logger.error(f"❌Error eliminando mensaje original de ver cola: {e}")
-                try:
-                    async for message in app.get_chat_history(callback_query.message.chat.id, limit=5):
-                        if message.text and "👀 Ver Cola" in message.text:
-                            await message.delete()
-                            break
-                except Exception as e2:
-                    logger.error(f"❌Error alternativo eliminando mensaje ver cola: {e2}")
+            # Opcional: eliminar también el mensaje anterior (si lo hubiera)
             await callback_query.answer("✅ Mensaje cerrado")
         except Exception as e:
-            logger.error(f"❌Error cerrando mensaje de cola: {e}")
+            logger.error(f"Error cerrando mensaje de cola: {e}")
             await callback_query.answer("❌ Error al cerrar el mensaje")
         return
+
     elif data == "refresh_plan":
         try:
             plan_info, keyboard = await get_plan_info(user_id)
@@ -3371,7 +3527,7 @@ async def callback_handler(client, callback_query: CallbackQuery):
                 "❌ **Desventajas:**\n"
                 "• **No podrá reenviar del bot**\n"
                 "• **Solo podrá comprimir 1 video a la vez**\n\n"
-                "• **Precio:** 0.20 USDT💰| 150 Cup💳 | 80 Cup SM📱\n"
+                "• **Precio:** 0.35 USDT💰| 250 Cup💳 | 150 Cup SM📱\n"
                 "• **Duración 7 días**\n"
             )
         elif plan_type == "pro":
@@ -3380,7 +3536,7 @@ async def callback_handler(client, callback_query: CallbackQuery):
                 "✅ **Beneficios:**\n"
                 "• **Videos para comprimir: ilimitados**\n"
                 "• **Podrá reenviar del bot**\n• **Podrá comprimir 2 videos a la vez**\n\n"
-                "• **Precio:** 0.35 USDT💰| 300 Cup💳 | 150 Cup SM📱\n"
+                "• **Precio:** 0.61 USDT💰| 600 Cup💳 | 300 Cup SM📱\n"
                 "• **Duración 15 días**\n"
             )
         elif plan_type == "premium":
@@ -3391,7 +3547,7 @@ async def callback_handler(client, callback_query: CallbackQuery):
                 "• **Soporte prioritario 24/7**\n"
                 "• **Podrá reenviar del bot**\n"
                 f"• **Múltiples videos en cola (hasta {PREMIUM_QUEUE_LIMIT})**\n\n"
-                "• **Precio:** 0.60 USDT💰| 500 Cup💳 | 250 Cup SM📱\n"
+                "• **Precio:** 0.86 USDT💰| 850 Cup💳 | 425 Cup SM📱\n"
                 "• **Duración 30 días**\n"
             )
         else:
@@ -3488,7 +3644,7 @@ async def callback_handler(client, callback_query: CallbackQuery):
             await callback_query.answer("⚠️ Este pago ya fue verificado o cancelado.", show_alert=True)
             return
         await update_payment_status(payment_id, "waiting_receipt", instruction_msg_id=callback_query.message.id)
-        await callback_query.message.edit_text("📸 **Mande captura de pantalla de la transferencia**\n\nLa captura debe ser completa, no recortada.\n\n", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar Pago", callback_data=f"cancel_payment_{payment_id}")]]))
+        await callback_query.message.edit_text("📸 **Mande captura de pantalla de la transferencia**\n\nLa captura debe ser completa, no recortada.\n\n", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Cancelar Pago ⛔", callback_data=f"cancel_payment_{payment_id}")]]))
         await callback_query.answer("✅ Envía la captura de tu transferencia.")
         return
     elif data.startswith("admin_accept_payment_"):
@@ -3571,6 +3727,7 @@ async def callback_handler(client, callback_query: CallbackQuery):
     else:
         await callback_query.answer("Opción inválida.", show_alert=True)
 
+# ======================== HANDLER DE PAGOS (fotos) ======================== #
 @app.on_message(filters.photo & filters.private)
 async def handle_payment_capture(client, message: Message):
     user_id = message.from_user.id
@@ -3633,7 +3790,7 @@ async def start_command(client, message):
         image_path = "logo.jpg"
         caption = ("**🤖 Bot para comprimir videos**\n➣**Creado por** @boyPhonk\n\n"
                    "**¡Bienvenido!** Puedo reducir el tamaño de los vídeos hasta un 80% o más y se verán bien sin perder tanta calidad.\n"
-                   "Usa los botones del menú para interactuar conmigo.\nSi tiene duda use el botón ℹ️ Ayuda\n\n**⚙️ Versión Basic 31.7.6 ⚙️**")
+                   "Usa los botones del menú para interactuar conmigo.\nSi tiene duda use el botón ℹ️ Ayuda\n\n**⚙️ Versión 31.8.0 ⚙️**")
         await send_protected_photo(chat_id=message.chat.id, photo=image_path, caption=caption, reply_markup=get_main_menu_keyboard())
         logger.info(f"🆗Comando /start ejecutado por {message.from_user.id}")
     except Exception as e:
@@ -3656,7 +3813,7 @@ async def main_menu_handler(client, message):
         elif text == "📊 mi plan":
             await my_plan_command(client, message)
         elif text == "ℹ️ ayuda":
-            support_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("👨🏻‍💻 Soporte", url="https://t.me/VirtualMix_Shop")]])
+            support_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("👨🏻‍💻 Soporte", url="https://t.me/boyPhonk")]])
             await send_protected_message(message.chat.id, "👨🏻‍💻 **Información**\n\n➣ **Configurar calidad**:\n• Usa el botón ⚙️ Settings\n➣ **Para comprimir un video**:\n• Envíalo directamente al bot (tanto como vídeo nativo o como documento de vídeo)\n• Extensiones válidas: mp4, mkv, avi, ts, mov, flv, wmv, webm, m4v, 3gp, mpeg, mpg, 3g2, rm, rmvb, vob, f4v, ogv, drc, nsv, mpe, m2v\n➣ **Ver planes**:\n• Usa el botón 📋 Planes\n➣ **Ver tu estado**:\n• Usa el botón 📊 Mi Plan\n➣ **Usa** /start **para iniciar en el bot nuevamente o para actualizar**\n➣ **Ver cola de compresión**:\n• Usa el botón 👀 Ver Cola\n➣ **Cancelar videos de la cola**:\n• Usa el botón 🗑️ Cancelar Cola\n➣ **Para ver su configuración de compresión actual use**: /calidad\n➣ **Para ver el estado del bot use**: /estado\n• Simplemente envía el documento y el bot lo procesará automáticamente.\n➣ **Comando** /mode **agregado.**\n• Ahora pueden elegir entre si comprimír directo sin configurar calidad o configurarle la calidad a cada video antes de comprimír\n\n**NUEVO SISTEMA:**\n• Los videos se descargan inmediatamente y se agregarán a la cola de compresión\n• Progreso en tiempo real", reply_markup=support_keyboard)
         elif text == "👀 ver cola":
             await queue_command(client, message)
@@ -3884,11 +4041,12 @@ async def user_info_command(client, message):
             join_date = user.get("join_date", "Desconocido")
             expires_at = user.get("expires_at", "No expira")
             compressed_videos = user.get("compressed_videos", 0)
+            user_number = user.get("user_number", "N/A")
             if isinstance(join_date, datetime.datetime):
                 join_date = join_date.strftime("%Y-%m-%d %H:%M:%S")
             if isinstance(expires_at, datetime.datetime):
                 expires_at = expires_at.strftime("%Y-%m-%d %H:%M:%S")
-            await message.reply(f"👤**Usuario**: {username}\n🆔 **ID**: `{user_id}`\n📝 **Plan**: {plan_name}\n🎬 **Videos comprimidos**: {compressed_videos}\n📅 **Fecha de registro**: {join_date}\n⏰ **Expira**: {expires_at}")
+            await message.reply(f"👤**Usuario**: {username}\n🆔 **ID**: `{user_id}`\n🔢 **Número**: {user_number}\n📝 **Plan**: {plan_name}\n🎬 **Videos comprimidos**: {compressed_videos}\n📅 **Fecha de registro**: {join_date}\n⏰ **Expira**: {expires_at}")
         else:
             await message.reply("⚠️ Usuario no registrado o sin plan")
     except Exception as e:
@@ -3915,15 +4073,16 @@ async def list_users_command(client, message):
             await message.reply("⛔**No hay usuarios registrados.**⛔")
             return
         response = "**Lista de Usuarios Registrados**\n\n"
-        for i, user in enumerate(all_users, 1):
+        for user in all_users:
             user_id = user["user_id"]
             plan = user["plan"].capitalize() if user.get("plan") else "Ninguno"
+            user_number = user.get("user_number", "?")
             try:
                 user_info = await app.get_users(user_id)
                 username = f"@{user_info.username}" if user_info.username else "Sin username"
             except:
                 username = "Sin username"
-            response += f"{i}• 👤 {username}\n   🆔 ID: `{user_id}`\n   📝 Plan: {plan}\n\n"
+            response += f"{user_number}• 👤 {username}\n   🆔 ID: `{user_id}`\n   📝 Plan: {plan}\n\n"
         await message.reply(response)
     except Exception as e:
         logger.error(f"❌Error en list_users_command: {e}", exc_info=True)
@@ -3951,10 +4110,10 @@ async def admin_stats_command(client, message):
                 comp_user_id = comp.get("user_id")
                 file_name = comp.get("file_name", "Sin nombre")
                 start_time = comp.get("start_time")
-                try:
-                    user = await app.get_users(comp_user_id)
-                    username = f"@{user.username}" if user.username else f"Usuario {comp_user_id}"
-                except:
+                user_number = get_user_number(comp_user_id)
+                if user_number:
+                    username = f"Usuario {user_number}"
+                else:
                     username = f"Usuario {comp_user_id}"
                 start_str = start_time.strftime("%H:%M:%S") if isinstance(start_time, datetime.datetime) else "¿?"
                 response += f"{i}. {username} - `{file_name}` (⏰ {start_str})\n"
@@ -4104,8 +4263,31 @@ async def queue_command(client, message):
     if user_plan is None or user_plan.get("plan") is None:
         await send_denied_access_message(message.chat.id)
         return
+
     queue_status, keyboard = await get_queue_status(user_id)
-    await send_protected_message(message.chat.id, queue_status, reply_markup=keyboard)
+
+    # Si ya hay un mensaje de cola para este usuario, cancelar tarea y eliminar mensaje anterior
+    if user_id in user_queue_tasks:
+        data = user_queue_tasks[user_id]
+        data["task"].cancel()
+        try:
+            await app.delete_messages(chat_id=data["chat_id"], message_ids=[data["message_id"]])
+        except Exception as e:
+            logger.error(f"Error eliminando mensaje de cola anterior: {e}")
+        del user_queue_tasks[user_id]
+
+    # Enviar mensaje nuevo
+    msg = await send_protected_message(message.chat.id, queue_status, reply_markup=keyboard)
+    chat_id = msg.chat.id
+    message_id = msg.id
+
+    # Crear la tarea de actualización
+    task = asyncio.create_task(update_queue_loop(chat_id, message_id, user_id))
+    user_queue_tasks[user_id] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "task": task
+    }
 
 async def notify_all_users(message_text: str):
     try:
