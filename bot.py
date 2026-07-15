@@ -36,8 +36,10 @@ WATCHDOG_INTERVAL = 60
 last_watchdog_run = None
 last_auto_expiry_check = None   
 
-# ======================== CONSTANTE PARA ESTIMACIÓN DE TIEMPO ======================== #
-# (Ya no se usa un tiempo fijo, solo se estima para el primer video en cola)
+# ======================== CONSTANTES FREE TIER ======================== #
+FREE_VIDEO_MAX_SIZE = 500 * 1024 * 1024        # 500 MB
+FREE_VIDEO_MAX_DURATION = 50 * 60              # 50 minutos
+FREE_COOLDOWN_HOURS = 48                       # 48 horas
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,11 +73,11 @@ downloaded_videos_col = db["downloaded_videos"]
 daily_stats_col = db["daily_stats"]
 pending_payments_col = db["pending_payments"]
 
-# ======================== NUEVA COLECCIÓN PARA CONTROL DE NOTIFICACIONES DE ACCESO DENEGADO ======================== #
+# ======================== COLECCIÓN PARA CONTROL DE NOTIFICACIONES DE ACCESO DENEGADO ======================== #
 access_denied_log_col = db["access_denied_log"]
 access_denied_log_col.create_index("user_id", unique=True)
 
-# ======================== NUEVA COLECCIÓN PARA CONTADOR SECUENCIAL ======================== #
+# ======================== CONTADOR SECUENCIAL ======================== #
 counters_col = db["counters"]
 if counters_col.count_documents({"_id": "pending_seq"}) == 0:
     counters_col.insert_one({"_id": "pending_seq", "seq": 0})
@@ -147,42 +149,27 @@ SUPPORTED_VIDEO_EXTENSIONS = [
     'mpeg', 'mpg', '3g2', 'rm', 'rmvb', 'vob', 'f4v', 'ogv', 'drc', 'nsv', 'mpe', 'm2v'
 ]
 
-# ======================== VARIABLE GLOBAL PARA EL WORKER DE DESCARGA ======================== #
 download_worker_task = None
-
-# ======================== ALMACENAMIENTO TEMPORAL PARA CONFIGURACIÓN DE VIDEOS ======================== #
 temp_video_configs = {}
+user_queue_tasks = {}
 
-# ======================== NUEVA VARIABLE PARA CONTROL DE TAREAS DE ACTUALIZACIÓN DE COLA ======================== #
-user_queue_tasks = {}  # user_id -> {"chat_id": int, "message_id": int, "task": asyncio.Task}
-
-# ======================== NUEVAS FUNCIONES PARA EL MODO DE COMPRESIÓN ======================== #
+# ======================== FUNCIONES PARA EL MODO DE COMPRESIÓN ======================== #
 async def get_user_compression_mode(user_id: int) -> str:
-    """Retorna 'after' (configurar al enviar) o 'before' (configurar antes de enviar)."""
     user_settings = user_settings_col.find_one({"user_id": user_id})
     if user_settings and "compression_mode" in user_settings:
         return user_settings["compression_mode"]
     return "before"
 
 async def set_user_compression_mode(user_id: int, mode: str):
-    """Guarda la preferencia del modo de compresión."""
     user_settings_col.update_one({"user_id": user_id}, {"$set": {"compression_mode": mode}}, upsert=True)
     logger.info(f"Modo de compresión actualizado para {user_id}: {mode}")
 
-# ======================== FUNCIÓN PARA CALCULAR HORAS ESTIMADAS DE INICIO (SOLO PARA EL PRIMERO) ======================== #
+# ======================== FUNCIONES PARA ESTIMACIÓN DE TIEMPO ======================== #
 async def calculate_estimated_start_times():
-    """
-    Calcula la hora estimada de inicio para cada video en la cola de compresión.
-    - El primer video (posición 1) obtiene la hora de finalización de la compresión activa (si existe),
-      o 'Inmediato' si no hay compresión activa.
-    - Los demás videos obtienen None (Sin calcular...).
-    Retorna una lista de diccionarios con compression_id, estimated_start (datetime o None) y position.
-    """
     downloaded_videos = list(downloaded_videos_col.find().sort("timestamp", 1))
     if not downloaded_videos:
         return []
 
-    # Verificar si hay compresión activa
     active_comp = active_compressions_col.find_one()
     now = datetime.datetime.now()
     estimated_start_first = None
@@ -209,17 +196,14 @@ async def calculate_estimated_start_times():
         else:
             estimated_start_first = now
     else:
-        # No hay compresión activa, el primero empieza ahora (Inmediato)
-        estimated_start_first = now  # Se mostrará como "Inmediato"
+        estimated_start_first = now
 
     estimated_times = []
     for idx, video in enumerate(downloaded_videos):
         comp_id = video["compression_id"]
         if idx == 0:
-            # Primer video en cola
             estimated_start = estimated_start_first
         else:
-            # Resto de videos: sin calcular
             estimated_start = None
         estimated_times.append({
             "compression_id": comp_id,
@@ -229,23 +213,19 @@ async def calculate_estimated_start_times():
     return estimated_times
 
 def format_start_time(estimated_start):
-    """Formatea la hora estimada de inicio para mostrarla en el mensaje."""
     if estimated_start is None:
         return "Sin calcular..."
     else:
-        # Si es ahora o en menos de 1 minuto, mostramos "Inmediato"
         now = datetime.datetime.now()
         if (estimated_start - now).total_seconds() < 60:
             return "Calculando..."
         else:
-            # Formato 12h con AM/PM en mayúsculas (zona Cuba)
             cuba_tz = zoneinfo.ZoneInfo("America/Havana")
             local_time = estimated_start.astimezone(cuba_tz)
             return local_time.strftime("%I:%M %p")
 
-# ======================== FUNCIONES PARA OBTENER NÚMERO DE USUARIO ======================== #
+# ======================== FUNCIONES PARA NÚMERO DE USUARIO ======================== #
 def get_next_user_seq():
-    """Obtiene el siguiente número secuencial para un nuevo usuario."""
     result = counters_col.find_one_and_update(
         {"_id": "user_seq"},
         {"$inc": {"seq": 1}},
@@ -254,31 +234,22 @@ def get_next_user_seq():
     return result["seq"]
 
 def get_user_number(user_id: int):
-    """
-    Retorna el número de usuario almacenado en la base de datos.
-    Si el usuario existe pero no tiene número, se le asigna uno automáticamente.
-    Si no existe, retorna None.
-    """
     user = users_col.find_one({"user_id": user_id}, {"user_number": 1})
     if user:
         if "user_number" in user:
             return user["user_number"]
         else:
-            # Asignar número secuencial
             new_number = get_next_user_seq()
             users_col.update_one({"user_id": user_id}, {"$set": {"user_number": new_number}})
             return new_number
     return None
 
-# ======================== FIN DE NUEVAS FUNCIONES ======================== #
-
+# ======================== FUNCIONES DE SOPORTE ======================== #
 def is_supported_video_file(filename: str) -> bool:
     if not filename:
         return False
     ext = filename.split('.')[-1].lower()
     return ext in SUPPORTED_VIDEO_EXTENSIONS
-
-# ======================== FUNCIONES PARA PERSONALIZACIÓN ======================== #
 
 def get_resolution_keyboard(selected_resolution=None):
     buttons = []
@@ -348,8 +319,7 @@ def get_audio_keyboard(selected_audio=None):
     buttons.append(nav_buttons)
     return InlineKeyboardMarkup(buttons)
 
-# ======================== FUNCIONES PARA CONFIGURACIÓN DE VIDEOS (con compression_id) ======================== #
-
+# ======================== TECLADOS PARA CONFIGURACIÓN POR VÍDEO ======================== #
 def get_resolution_keyboard_video(compression_id, selected_resolution=None):
     buttons = []
     resolutions = [('360', '360'), ('480', '480'), ('720', '720')]
@@ -445,7 +415,6 @@ async def apply_custom_settings(user_id, settings):
         return False
 
 # ======================== FUNCIONES PARA ESTADÍSTICAS DIARIAS ======================== #
-
 def get_today_date_str():
     return datetime.datetime.now().strftime("%Y-%m-%d")
 
@@ -481,7 +450,6 @@ async def get_daily_stats() -> dict:
     return doc
 
 # ======================== EXPORTACIÓN/IMPORTACIÓN DB ======================== #
-
 @app.on_message(filters.command("getdb") & filters.user(admin_users))
 async def get_db_command(client, message):
     try:
@@ -538,7 +506,6 @@ async def handle_db_restore(client, message):
         await message.reply("❌ Error al restaurar la base de datos.")
 
 # ======================== COMANDO BACKUP ======================== #
-
 @app.on_message(filters.command("backup") & filters.user(admin_users))
 async def backup_command(client, message):
     try:
@@ -582,7 +549,6 @@ async def backup_command(client, message):
             await message.reply("❌ **Error al crear el backup**")
 
 # ======================== COMANDO SETDAYS ======================== #
-
 async def add_days_to_all_users(days: int, admin_id: int):
     try:
         users = list(users_col.find({"plan": {"$in": ["standard", "pro", "premium"]}, "expires_at": {"$exists": True}}))
@@ -647,7 +613,6 @@ async def setdays_command(client, message):
         await message.reply("❌ **Error al procesar el comando**")
 
 # ======================== COMANDO STATUS ======================== #
-
 def get_status_stats():
     try:
         cpu_percent = psutil.cpu_percent(interval=0.5)
@@ -737,7 +702,6 @@ async def log_command(client, message):
         await message.reply("❌ Error al enviar el log.")
 
 # ======================== COMANDOS DE MANTENIMIENTO ======================== #
-
 @app.on_message(filters.command("estado") & filters.private)
 async def estado_command(client, message):
     try:
@@ -795,7 +759,6 @@ async def maintenance_off_command(client, message):
         await message.reply("⚠️ **Error al desactivar el modo mantenimiento**")
 
 # ======================== FUNCIONES AUXILIARES ======================== #
-
 def format_time(seconds):
     if seconds < 0:
         return "00:00"
@@ -845,7 +808,6 @@ async def check_maintenance_and_notify(user_id: int, chat_id: int, message_text:
     return False
 
 # ======================== CONFIGURACIÓN POR USUARIO ======================== #
-
 async def get_user_video_settings(user_id: int) -> dict:
     user_settings = user_settings_col.find_one({"user_id": user_id})
     if user_settings and "video_settings" in user_settings:
@@ -997,7 +959,6 @@ async def get_queue_status(user_id=None):
                 comp_id = item["compression_id"]
                 file_name = item.get("file_name", "Sin nombre")
                 uid = item["user_id"]
-                # Mostrar "Tu*" si el usuario coincide con el que consulta
                 if user_id is not None and uid == user_id:
                     username_display = "(Tu)"
                 else:
@@ -1016,7 +977,6 @@ async def get_queue_status(user_id=None):
                 compression_id = comp.get("compression_id")
                 comp_user_id = comp.get("user_id")
                 file_name = comp.get("file_name", "Sin nombre")
-                # Mostrar "Tu*" si el usuario coincide con el que consulta
                 if user_id is not None and comp_user_id == user_id:
                     username_display = "(Tu)"
                 else:
@@ -1038,7 +998,6 @@ async def get_queue_status(user_id=None):
                 video_user_id = video.get("user_id")
                 user_video_counts[video_user_id] = user_video_counts.get(video_user_id, 0) + 1
             for i, (video_user_id, count) in enumerate(user_video_counts.items(), 1):
-                # Mostrar "Tu*" si el usuario coincide con el que consulta
                 if user_id is not None and video_user_id == user_id:
                     username_display = "(Tu)"
                 else:
@@ -1070,7 +1029,6 @@ async def get_queue_status(user_id=None):
 
 # ======================== NUEVA FUNCIÓN PARA ACTUALIZACIÓN AUTOMÁTICA DE LA COLA ======================== #
 async def update_queue_loop(chat_id: int, message_id: int, user_id: int):
-    """Bucle que actualiza el mensaje de la cola cada 6 segundos."""
     try:
         while True:
             await asyncio.sleep(6)
@@ -1083,14 +1041,13 @@ async def update_queue_loop(chat_id: int, message_id: int, user_id: int):
                     reply_markup=keyboard
                 )
             except MessageNotModified:
-                pass  # No hubo cambios
+                pass
             except Exception as e:
                 logger.error(f"Error actualizando mensaje de cola {message_id}: {e}")
-                break  # Si el mensaje ya no existe, salimos
+                break
     except asyncio.CancelledError:
         logger.info(f"Tarea de actualización de cola {message_id} cancelada")
     finally:
-        # Limpiar la entrada del diccionario si aún existe
         if user_id in user_queue_tasks:
             data = user_queue_tasks.get(user_id)
             if data and data.get("message_id") == message_id and data.get("chat_id") == chat_id:
@@ -1259,12 +1216,162 @@ async def register_new_user(user_id: int):
     if not users_col.find_one({"user_id": user_id}):
         logger.info(f"⛔Usuario no registrado: {user_id}")
 
+# ======================== FUNCIONES DE PLAN Y FREE TIER ======================== #
+async def get_user_plan(user_id: int) -> dict:
+    """
+    Retorna el plan del usuario. Si no existe o está expirado, se considera "free"
+    y se crea/actualiza el registro en la base de datos.
+    """
+    now = datetime.datetime.now()
+    user = users_col.find_one({"user_id": user_id})
+    if not user:
+        # Crear usuario nuevo con plan None (free)
+        new_user = {
+            "user_id": user_id,
+            "plan": None,
+            "join_date": now,
+            "user_number": get_next_user_seq(),
+            "last_free_use_time": None,
+            "free_usage_count": 0
+        }
+        users_col.insert_one(new_user)
+        return {"plan": None, "user_id": user_id, "last_free_use_time": None, "free_usage_count": 0}
+    
+    plan = user.get("plan")
+    # Si tiene un plan de pago, verificar expiración
+    if plan in ["standard", "pro", "premium"]:
+        expires_at = user.get("expires_at")
+        if expires_at and now > expires_at:
+            # Plan expirado -> pasar a free
+            users_col.update_one(
+                {"user_id": user_id},
+                {"$set": {"plan": None, "last_free_use_time": None, "free_usage_count": 0}}
+            )
+            return {"plan": None, "user_id": user_id, "last_free_use_time": None, "free_usage_count": 0}
+        else:
+            # Plan activo
+            return user
+    else:
+        # plan es None o "free" o ultra (ultra es ilimitado, pero también lo tratamos como pagado)
+        if plan == "ultra":
+            return user
+        # Es free (o None)
+        return {"plan": None, "user_id": user_id, "last_free_use_time": user.get("last_free_use_time"), "free_usage_count": user.get("free_usage_count", 0)}
+
+async def can_use_free_tier(user_id: int) -> tuple:
+    """
+    Verifica si el usuario puede usar la capa gratuita.
+    Retorna (bool, mensaje).
+    """
+    user = await get_user_plan(user_id)
+    if user.get("plan") is not None:
+        # Tiene un plan de pago, puede usar sin restricciones de free tier
+        return True, ""
+    
+    last_use = user.get("last_free_use_time")
+    if last_use is None:
+        return True, ""
+    
+    # Si ya usó el free tier, verificar cooldown
+    now = datetime.datetime.now()
+    if isinstance(last_use, datetime.datetime):
+        diff = now - last_use
+        if diff.total_seconds() < FREE_COOLDOWN_HOURS * 3600:
+            remaining = FREE_COOLDOWN_HOURS * 3600 - diff.total_seconds()
+            hours = int(remaining // 3600)
+            minutes = int((remaining % 3600) // 60)
+            return False, f"Usted ya ha usado la capa gratuita. Podrá comprimir otro video dentro de {hours}h {minutes}min."
+    return True, ""
+
+async def send_free_start_message(chat_id: int):
+    """
+    Envía el mensaje de bienvenida para usuarios sin plan (free tier).
+    """
+    text = (
+        "🤖 **Bot para comprimir videos**\n"
+        "Puedo reducir el tamaño de los vídeos hasta un 80% o más y se verán bien sin perder calidad.\n\n"
+        "Usted tiene acceso a un **plan gratuito** de **1 video cada 48 horas**.\n\n"
+        "- El vídeo no puede ser mayor de **500 MB**.\n"
+        "- El vídeo no puede durar más de **50 minutos**.\n\n"
+        "❌ No puede reenviar videos ni archivos si no tiene un plan de pago.\n\n"
+        "💲 Para ver los planes disponibles, use el comando /planes."
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💠 Ver Planes 💠", callback_data="show_plans_from_start")]
+    ])
+    await app.send_message(chat_id, text, reply_markup=keyboard)
+
+async def send_denied_access_message(chat_id: int):
+    """Redirige al mensaje de bienvenida free tier."""
+    await send_free_start_message(chat_id)
+
+async def can_notify_access_denied(user_id: int) -> bool:
+    now = datetime.datetime.now()
+    doc = access_denied_log_col.find_one({"user_id": user_id})
+    if doc:
+        last = doc.get("last_notification")
+        if last and (now - last).total_seconds() < 300:
+            return False
+    access_denied_log_col.update_one({"user_id": user_id}, {"$set": {"last_notification": now}}, upsert=True)
+    return True
+
+async def show_plan_selection(chat_id, user_id, current_plan=None):
+    texto, keyboard = await get_plan_menu(user_id)
+    await send_protected_message(chat_id, texto, reply_markup=keyboard)
+
+async def get_plan_menu(user_id: int):
+    user = await get_user_plan(user_id)
+    if user is None or user.get("plan") is None:
+        message_text = (
+            "**No tienes un plan activo.**\n"
+            "Adquiere un plan para usar el bot.\n\n"
+            "📋 Selecciona un plan para más información:"
+        )
+    else:
+        plan_name = user["plan"].capitalize()
+        expires_at = user.get("expires_at")
+        if isinstance(expires_at, datetime.datetime):
+            now = datetime.datetime.now()
+            if expires_at > now:
+                time_remaining = expires_at - now
+                days = time_remaining.days
+                hours = time_remaining.seconds // 3600
+                minutes = (time_remaining.seconds % 3600) // 60
+                if days > 0:
+                    expires_text = f"{days}d {hours}h {minutes}m"
+                elif hours > 0:
+                    expires_text = f"{hours}h {minutes}m"
+                else:
+                    expires_text = f"{minutes}m"
+            else:
+                expires_text = "Expirado"
+        else:
+            expires_text = "No expira"
+        message_text = (
+            f"╭✠━━━━━━━━━━━━━━━━━━━━━━✠╮\n"
+            f"┠➣ **Tu plan actual:** {plan_name}\n"
+            f"┠➣ **Tiempo restante:** {expires_text}\n"
+            f"╰✠━━━━━━━━━━━━━━━━━━━━━━✠╯\n\n"
+            "📋 Selecciona un plan para más información:"
+        )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧩 Estándar", callback_data="plan_standard")],
+        [InlineKeyboardButton("💎 Pro", callback_data="plan_pro")],
+        [InlineKeyboardButton("👑 Premium", callback_data="plan_premium")]
+    ])
+    return message_text, keyboard
+
 async def should_protect_content(user_id: int) -> bool:
     if user_id in admin_users:
         return False
     user_plan = await get_user_plan(user_id)
-    return user_plan is not None and user_plan.get("plan") == "standard"
+    plan = user_plan.get("plan")
+    # Los usuarios free y standard no pueden reenviar
+    if plan is None or plan == "standard" or plan == "free":
+        return True
+    return False
 
+# ======================== FUNCIONES DE PROTECCIÓN DE MENSAJES ======================== #
 async def send_protected_message(chat_id: int, text: str, **kwargs):
     protect = await should_protect_content(chat_id)
     return await app.send_message(chat_id, text, protect_content=protect, **kwargs)
@@ -1289,9 +1396,11 @@ async def send_protected_voice(chat_id: int, voice: str, caption: str = None, **
     protect = await should_protect_content(chat_id)
     return await app.send_voice(chat_id, voice, caption=caption, protect_content=protect, **kwargs)
 
+# ======================== FUNCIONES DE COLA Y LÍMITES ======================== #
 async def get_user_queue_limit(user_id: int) -> int:
     user_plan = await get_user_plan(user_id)
-    if user_plan is None:
+    if user_plan is None or user_plan.get("plan") is None:
+        # Los usuarios free también tienen límite de 1
         return 1
     plan = user_plan["plan"]
     if plan == "ultra":
@@ -1301,7 +1410,7 @@ async def get_user_queue_limit(user_id: int) -> int:
     elif plan == "pro":
         return PRO_QUEUE_LIMIT
     else:
-        return 1
+        return 1  # standard y free
 
 def generate_temp_key(plan: str, duration_value: int, duration_unit: str):
     key = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
@@ -1501,28 +1610,6 @@ async def manual_check_expiry_command(client, message):
         time_str = f"{minutes} min {seconds} seg" if minutes > 0 else f"{seconds} seg"
     await message.reply(f"✅ Verificación manual completada.\n\n📅 Última verificación automática: hace {time_str}")
 
-async def get_user_plan(user_id: int) -> dict:
-    user = users_col.find_one({"user_id": user_id})
-    now = datetime.datetime.now()
-    if user:
-        plan = user.get("plan")
-        if plan is None:
-            users_col.delete_one({"user_id": user_id})
-            return None
-        if plan != "ultra":
-            expires_at = user.get("expires_at")
-            if expires_at and now > expires_at:
-                users_col.delete_one({"user_id": user_id})
-                return None
-        update_data = {}
-        if "last_used_date" not in user:
-            update_data["last_used_date"] = None
-        if update_data:
-            users_col.update_one({"user_id": user_id}, {"$set": update_data})
-            user.update(update_data)
-        return user
-    return None
-
 async def set_user_plan(user_id: int, plan: str, notify: bool = True, expires_at: datetime = None):
     if plan not in PLAN_DURATIONS:
         return False
@@ -1543,12 +1630,15 @@ async def set_user_plan(user_id: int, plan: str, notify: bool = True, expires_at
     existing_user = users_col.find_one({"user_id": user_id})
     if not existing_user:
         user_data["join_date"] = datetime.datetime.now()
-        # Asignar número de usuario secuencial
         user_data["user_number"] = get_next_user_seq()
+        user_data["last_free_use_time"] = None
+        user_data["free_usage_count"] = 0
     else:
-        # Si el usuario ya existe pero no tiene user_number (por ejemplo, de versiones anteriores), se lo asignamos
         if "user_number" not in existing_user:
             user_data["user_number"] = get_next_user_seq()
+        # Resetear free tier al activar un plan de pago
+        user_data["last_free_use_time"] = None
+        user_data["free_usage_count"] = 0
     await reset_expiry_notification_flags(user_id)
     users_col.update_one({"user_id": user_id}, {"$set": user_data}, upsert=True)
     if notify:
@@ -1563,16 +1653,10 @@ async def set_user_plan(user_id: int, plan: str, notify: bool = True, expires_at
             logger.error(f"❌Error notificando al usuario {user_id}: {e}")
     return True
 
-async def check_user_limit(user_id: int) -> bool:
-    user = await get_user_plan(user_id)
-    if user is None or user.get("plan") is None:
-        return True
-    return False
-
 async def get_plan_info(user_id: int):
     user = await get_user_plan(user_id)
     if user is None or user.get("plan") is None:
-        return "🚫**No tienes un plan activo**🚫\n\n⬇️**Toque para ver nuestros planes**⬇️", None
+        return "🚫 **No tienes un plan activo** 🚫\n\n⬇️ **Toque para ver nuestros planes** ⬇️", InlineKeyboardMarkup([[InlineKeyboardButton("💠 Planes", callback_data="show_plans_from_start")]])
     plan_name = user["plan"].capitalize()
     expires_at = user.get("expires_at")
     expires_text = "No expira"
@@ -1664,13 +1748,11 @@ async def progress_callback(current, total, msg, proceso, start_time):
         update_compression_progress(compression_id, stage_for_update, current, total, percentage * 100, file_name)
         reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Cancelar ⛔", callback_data=f"cancel_task_{compression_id}")]])
 
-        # ========== CÁLCULO DE HORA DE FINALIZACIÓN (Cuba) usando zoneinfo ==========
         cuba_tz = zoneinfo.ZoneInfo("America/Havana")
         now_cuba = datetime.datetime.now(cuba_tz)
         eta_seconds = eta if eta > 0 else 0
         finish_time = now_cuba + datetime.timedelta(seconds=eta_seconds)
-        finish_str = finish_time.strftime("%I:%M %p")  # AM/PM en mayúsculas
-        # ========================================================================
+        finish_str = finish_time.strftime("%I:%M %p")
 
         try:
             await msg.edit(
@@ -1692,8 +1774,6 @@ async def progress_callback(current, total, msg, proceso, start_time):
         raise e
     except Exception as e:
         logger.error(f"❌Error en progress_callback: {e}", exc_info=True)
-
-# ======================== NUEVAS FUNCIONES PARA ACTUALIZAR POSICIONES ======================== #
 
 async def update_all_download_waiting_messages():
     pending = list(pending_col.find().sort("seq", 1))
@@ -1717,9 +1797,7 @@ async def update_all_download_waiting_messages():
         except Exception as e:
             logger.error(f"❌Error actualizando mensaje de descarga {compression_id}: {e}")
 
-# ======================== ACTUALIZACIÓN DE MENSAJES DE ESPERA DE COMPRESIÓN CON HORA ESTIMADA (SOLO PARA EL PRIMERO) ======================== #
 async def update_all_compression_waiting_messages():
-    # Obtener las horas estimadas para cada video en cola
     estimated_times = await calculate_estimated_start_times()
     times_dict = {item["compression_id"]: item for item in estimated_times}
 
@@ -1734,14 +1812,12 @@ async def update_all_compression_waiting_messages():
         if not chat_id:
             continue
 
-        # Obtener la hora estimada para este video
         time_info = times_dict.get(compression_id)
         if time_info:
             estimated_start = time_info["estimated_start"]
             position = time_info["position"]
             start_text = format_start_time(estimated_start)
         else:
-            # Fallback: si no está en la lista, calcular posición manualmente
             start_text = "Sin calcular..."
             position = idx
 
@@ -1759,17 +1835,14 @@ async def update_all_compression_waiting_messages():
         except Exception as e:
             logger.error(f"❌Error actualizando mensaje de compresión {compression_id}: {e}")
 
-# ======================== BUCLE DE ACTUALIZACIÓN PERIÓDICA (CADA 80 Segundos) ======================== #
 async def update_compression_waiting_messages_loop():
     while True:
-        await asyncio.sleep(80) 
+        await asyncio.sleep(80)
         try:
             await update_all_compression_waiting_messages()
             logger.debug("Mensajes de cola de compresión actualizados (loop de 80 Seg)")
         except Exception as e:
             logger.error(f"Error en update_compression_waiting_messages_loop: {e}")
-
-# ======================== FIN DE NUEVAS FUNCIONES ======================== #
 
 async def get_download_queue_position(compression_id: str) -> int:
     pending_item = pending_col.find_one({"compression_id": compression_id})
@@ -1865,14 +1938,12 @@ async def download_file_immediately_worker(compression_id, user_id, chat_id, ori
             await add_downloaded_video(user_id, original_video_path, file_name, compression_id, chat_id, wait_msg.id, caption, custom_settings)
             downloaded_count = downloaded_videos_col.count_documents({})
 
-            # --- Calcular hora estimada de inicio para este video (solo si es el primero) ---
             estimated_times = await calculate_estimated_start_times()
             time_info = next((t for t in estimated_times if t["compression_id"] == compression_id), None)
             if time_info:
                 position = time_info["position"]
                 start_text = format_start_time(time_info["estimated_start"])
             else:
-                # Fallback: si no está en la lista, usar posición actual
                 position = downloaded_count
                 start_text = "Sin calcular..."
 
@@ -1932,7 +2003,7 @@ async def download_file_immediately_worker(compression_id, user_id, chat_id, ori
         logger.error(f"❌Error en download_file_immediately_worker: {e}", exc_info=True)
         return False
 
-# ========= WORKER DE DESCARGA (cola priorizada) CON RESILIENCIA =========
+# ========= WORKER DE DESCARGA =========
 async def download_worker():
     while True:
         try:
@@ -1995,7 +2066,7 @@ async def watchdog_download_worker():
         except Exception as e:
             logger.error(f"❌Error en watchdog_download_worker: {e}", exc_info=True)
 
-# ========= WORKER DE COMPRESIÓN (original) =========
+# ========= WORKER DE COMPRESIÓN =========
 async def process_compression_queue():
     while True:
         task = None
@@ -2038,17 +2109,17 @@ def threading_compress_video_from_path(task, start_msg):
 
 async def compress_video_from_path(task, start_msg):
     cleaned_up = False
-    try:
-        compression_id = task["compression_id"]
-        user_id = task["user_id"]
-        original_video_path = task["original_video_path"]
-        file_name = task["file_name"]
-        chat_id = task["chat_id"]
-        original_message_id = task["original_message_id"]
-        wait_msg = task["wait_msg"]
-        original_caption = task.get("caption")
-        custom_settings = task.get("custom_settings")
+    compression_id = task["compression_id"]
+    user_id = task["user_id"]
+    original_video_path = task["original_video_path"]
+    file_name = task["file_name"]
+    chat_id = task["chat_id"]
+    original_message_id = task["original_message_id"]
+    wait_msg = task["wait_msg"]
+    original_caption = task.get("caption")
+    custom_settings = task.get("custom_settings")
 
+    try:
         if not os.path.exists(original_video_path):
             if wait_msg:
                 await wait_msg.edit_text("❌ **Error: Archivo no encontrado**")
@@ -2078,7 +2149,6 @@ async def compress_video_from_path(task, start_msg):
         await add_active_compression(compression_id, user_id, None, file_name)
 
         progress_bar = create_progress_bar(0, 100, "COMPRESIÓN")
-        # ================== MENSAJE INICIAL CON "Calculando..." ==================
         msg = await app.send_message(
             chat_id=chat_id,
             text=f"   {progress_bar}\n"
@@ -2202,7 +2272,6 @@ async def compress_video_from_path(task, start_msg):
                             bar = create_compression_bar(percent)
                             cancel_button = InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Cancelar ⛔", callback_data=f"cancel_task_{compression_id}")]])
 
-                            # ========== CÁLCULO DE HORA DE FINALIZACIÓN ==========
                             if percent == 0 or remaining_seconds == 0:
                                 finish_str = "Calculando..."
                             else:
@@ -2210,8 +2279,7 @@ async def compress_video_from_path(task, start_msg):
                                 now_cuba = datetime.datetime.now(cuba_tz)
                                 remaining_seconds_safe = max(0, remaining_seconds)
                                 finish_time = now_cuba + datetime.timedelta(seconds=remaining_seconds_safe)
-                                finish_str = finish_time.strftime("%I:%M %p")  # AM/PM mayúsculas
-                            # =====================================================
+                                finish_str = finish_time.strftime("%I:%M %p")
 
                             try:
                                 await msg.edit(
@@ -2319,6 +2387,19 @@ async def compress_video_from_path(task, start_msg):
                 await update_daily_stats_compressed()
                 await notify_group(app, await app.get_messages(chat_id, original_message_id), original_size, compressed_size=compressed_size, status="done", processing_time_str=processing_time_str, compressed_name=base_name)
                 users_col.update_one({"user_id": user_id}, {"$inc": {"compressed_videos": 1}}, upsert=True)
+
+                # ========== ACTUALIZAR FREE TIER SI ES USUARIO SIN PLAN ==========
+                user_plan = await get_user_plan(user_id)
+                if user_plan.get("plan") is None:
+                    # Es usuario free, actualizar last_free_use_time
+                    users_col.update_one(
+                        {"user_id": user_id},
+                        {"$set": {"last_free_use_time": datetime.datetime.now()},
+                         "$inc": {"free_usage_count": 1}}
+                    )
+                    logger.info(f"📌 Free tier actualizado para usuario {user_id}")
+                # ================================================================
+
                 try:
                     if wait_msg:
                         await wait_msg.delete()
@@ -2460,7 +2541,6 @@ async def daily_stats_command(client, message):
         await message.reply("❌ Error al obtener estadísticas.")
 
 # ======================== INTERFAZ DE USUARIO ======================== #
-
 def get_main_menu_keyboard():
     return ReplyKeyboardMarkup(
         [[KeyboardButton("⚙️ Settings"), KeyboardButton("📋 Planes")],
@@ -2480,78 +2560,6 @@ async def settings_menu(client, message):
     ])
     await send_protected_message(message.chat.id, "⚙️𝗦𝗲𝗹𝗲𝗰𝗰𝗶𝗼𝗻𝗮𝗿 𝗖𝗮𝗹𝗶𝗱𝗮𝗱⚙️", reply_markup=keyboard)
 
-# ======================== MENÚ DE PLANES MODIFICADO ======================== #
-async def get_plan_menu(user_id: int):
-    user = await get_user_plan(user_id)
-    if user is None or user.get("plan") is None:
-        message_text = (
-            "**No tienes un plan activo.**\n"
-            "Adquiere un plan para usar el bot.\n\n"
-            "📋 Selecciona un plan para más información:"
-        )
-    else:
-        plan_name = user["plan"].capitalize()
-        expires_at = user.get("expires_at")
-        if isinstance(expires_at, datetime.datetime):
-            now = datetime.datetime.now()
-            if expires_at > now:
-                time_remaining = expires_at - now
-                days = time_remaining.days
-                hours = time_remaining.seconds // 3600
-                minutes = (time_remaining.seconds % 3600) // 60
-                if days > 0:
-                    expires_text = f"{days}d {hours}h {minutes}m"
-                elif hours > 0:
-                    expires_text = f"{hours}h {minutes}m"
-                else:
-                    expires_text = f"{minutes}m"
-            else:
-                expires_text = "Expirado"
-        else:
-            expires_text = "No expira"
-        message_text = (
-            f"╭✠━━━━━━━━━━━━━━━━━━━━━━✠╮\n"
-            f"┠➣ **Tu plan actual:** {plan_name}\n"
-            f"┠➣ **Tiempo restante:** {expires_text}\n"
-            f"╰✠━━━━━━━━━━━━━━━━━━━━━━✠╯\n\n"
-            "📋 Selecciona un plan para más información:"
-        )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧩 Estándar", callback_data="plan_standard")],
-        [InlineKeyboardButton("💎 Pro", callback_data="plan_pro")],
-        [InlineKeyboardButton("👑 Premium", callback_data="plan_premium")]
-    ])
-    return message_text, keyboard
-
-async def send_denied_access_message(chat_id: int):
-    await send_protected_message(
-        chat_id,
-        "**🤖 Bot para comprimir videos**\nPuedo reducir el tamaño de los vídeos hasta un 80% o más y se verán bien sin perder tanta calidad.\n\n⬇️**Toque para ver nuestros planes**⬇️",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💠Planes💠", callback_data="show_plans_from_start")]])
-    )
-
-async def can_notify_access_denied(user_id: int) -> bool:
-    now = datetime.datetime.now()
-    doc = access_denied_log_col.find_one({"user_id": user_id})
-    if doc:
-        last = doc.get("last_notification")
-        if last and (now - last).total_seconds() < 300:
-            return False
-    access_denied_log_col.update_one({"user_id": user_id}, {"$set": {"last_notification": now}}, upsert=True)
-    return True
-
-async def send_no_plan_response(message: Message):
-    user_id = message.from_user.id
-    if not await can_notify_access_denied(user_id):
-        return
-    text = "🚫**Usted no tiene acceso para usar el bot**🚫\n⬇️**Toque para ver nuestros planes**⬇️"
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("💠Planes💠", callback_data="show_plans_from_start")]])
-    await app.send_message(message.chat.id, text, reply_to_message_id=message.id, reply_markup=keyboard)
-
-async def show_plan_selection(chat_id, user_id, current_plan=None):
-    text, keyboard = await get_plan_menu(user_id)
-    await send_protected_message(chat_id, text, reply_markup=keyboard)
-
 @app.on_message(filters.command("planes") & filters.private)
 async def planes_command(client, message):
     try:
@@ -2560,89 +2568,6 @@ async def planes_command(client, message):
     except Exception as e:
         logger.error(f"❌Error en planes_command: {e}", exc_info=True)
         await send_protected_message(message.chat.id, "⚠️ Error al mostrar los planes")
-
-@app.on_message(filters.command("convert") & filters.private & filters.reply)
-async def convert_command(client, message: Message):
-    try:
-        user_id = message.from_user.id
-        if await check_maintenance_and_notify(user_id, message.chat.id):
-            return
-        if user_id in ban_users:
-            logger.warning(f"⛔Intento de uso por usuario baneado: {user_id}")
-            return
-        user_plan = await get_user_plan(user_id)
-        if user_plan is None or user_plan.get("plan") is None:
-            await send_no_plan_response(message)
-            return
-        replied = message.reply_to_message
-        if not replied or not replied.document:
-            await send_protected_message(message.chat.id, "❌ **Debes responder a un documento que sea un vídeo.**")
-            return
-        doc = replied.document
-        file_name = doc.file_name or "video_sin_nombre"
-        if not is_supported_video_file(file_name):
-            await send_protected_message(message.chat.id, f"❌ **Formato no soportado.**\nExtensiones válidas: {', '.join(SUPPORTED_VIDEO_EXTENSIONS)}")
-            return
-        await process_media_file(client, message, doc, file_name)
-    except Exception as e:
-        logger.error(f"❌Error en convert_command: {e}", exc_info=True)
-        await send_protected_message(message.chat.id, "⚠️ **Error al procesar el comando /convert**")
-
-async def process_media_file(client, message: Message, file_obj, file_name: str):
-    user_id = message.from_user.id
-    if user_id in ban_users:
-        logger.warning(f"⛔Intento de uso por usuario baneado: {user_id}")
-        return
-    user_plan = await get_user_plan(user_id)
-    if user_plan is None or user_plan.get("plan") is None:
-        await send_no_plan_response(message)
-        return
-    queue_limit = await get_user_queue_limit(user_id)
-    pending_count = pending_col.count_documents({"user_id": user_id})
-    downloaded_count = await get_user_downloaded_count(user_id)
-    total_pending = pending_count + downloaded_count
-    if total_pending >= queue_limit:
-        await send_protected_message(
-            message.chat.id,
-            f"Ya tienes {total_pending} videos en cola (límite: {queue_limit}).\nPor favor espera a que se procesen antes de enviar más.",
-            reply_to_message_id=message.id
-        )
-        return
-
-    compression_mode = await get_user_compression_mode(user_id)
-    if compression_mode == "before":
-        settings = await get_user_video_settings(user_id)
-        await process_video_directly(user_id, message.chat.id, message.id, file_obj, file_name, message.caption, custom_settings=settings)
-        logger.info(f"✅Video procesado directamente (modo before) para {user_id}: {file_name}")
-    else:
-        compression_id = generate_compression_id()
-        seq = get_next_pending_seq()
-        pending_col.insert_one({
-            "user_id": user_id,
-            "video_id": getattr(file_obj, 'file_id', None),
-            "file_name": file_name,
-            "chat_id": message.chat.id,
-            "message_id": message.id,
-            "compression_id": compression_id,
-            "timestamp": datetime.datetime.now(),
-            "caption": message.caption,
-            "seq": seq,
-            "status": "awaiting_config",
-            "custom_settings": None,
-            "wait_message_id": None
-        })
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🛠️ Personalizar Calidad 🔧", callback_data=f"config_video_{compression_id}")],
-            [InlineKeyboardButton("⚙️ Resolucion ⚙️", callback_data=f"select_resolution_{compression_id}")],
-            [InlineKeyboardButton("⛔ Cancelar ⛔", callback_data=f"vid_cancel_{compression_id}")]
-        ])
-        await send_protected_message(
-            message.chat.id,
-            "🛠️ **Personaliza la calidad de este video**\n\nConfigura la calidad de compresión para este video.\n**Para cambiar de configuración de compresión use /mode**",
-            reply_to_message_id=message.id,
-            reply_markup=keyboard
-        )
-        logger.info(f"✅Video en espera de configuración (modo after) para {user_id}: {compression_id}")
 
 async def process_video_directly(user_id: int, chat_id: int, original_message_id: int, file_obj, file_name: str, caption: str = None, custom_settings: dict = None):
     if not file_name:
@@ -2685,6 +2610,146 @@ async def process_video_directly(user_id: int, chat_id: int, original_message_id
     ))
     logger.info(f"✅Tarea de descarga encolada con seq={seq} para {file_name}")
     return True
+
+async def process_media_file(client, message: Message, file_obj, file_name: str):
+    user_id = message.from_user.id
+    if user_id in ban_users:
+        logger.warning(f"⛔Intento de uso por usuario baneado: {user_id}")
+        return
+
+    user_plan = await get_user_plan(user_id)
+    # Si tiene plan de pago, comportamiento normal
+    if user_plan.get("plan") is not None:
+        # Usuario con plan pago
+        queue_limit = await get_user_queue_limit(user_id)
+        pending_count = pending_col.count_documents({"user_id": user_id})
+        downloaded_count = await get_user_downloaded_count(user_id)
+        total_pending = pending_count + downloaded_count
+        if total_pending >= queue_limit:
+            await send_protected_message(
+                message.chat.id,
+                f"Ya tienes {total_pending} videos en cola (límite: {queue_limit}).\nPor favor espera a que se procesen antes de enviar más.",
+                reply_to_message_id=message.id
+            )
+            return
+
+        compression_mode = await get_user_compression_mode(user_id)
+        if compression_mode == "before":
+            settings = await get_user_video_settings(user_id)
+            await process_video_directly(user_id, message.chat.id, message.id, file_obj, file_name, message.caption, custom_settings=settings)
+            logger.info(f"✅Video procesado directamente (modo before) para {user_id}: {file_name}")
+        else:
+            # Modo after: mostrar menú de configuración
+            compression_id = generate_compression_id()
+            seq = get_next_pending_seq()
+            pending_col.insert_one({
+                "user_id": user_id,
+                "video_id": getattr(file_obj, 'file_id', None),
+                "file_name": file_name,
+                "chat_id": message.chat.id,
+                "message_id": message.id,
+                "compression_id": compression_id,
+                "timestamp": datetime.datetime.now(),
+                "caption": message.caption,
+                "seq": seq,
+                "status": "awaiting_config",
+                "custom_settings": None,
+                "wait_message_id": None
+            })
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛠️ Personalizar Calidad 🔧", callback_data=f"config_video_{compression_id}")],
+                [InlineKeyboardButton("⚙️ Resolucion ⚙️", callback_data=f"select_resolution_{compression_id}")],
+                [InlineKeyboardButton("⛔ Cancelar ⛔", callback_data=f"vid_cancel_{compression_id}")]
+            ])
+            await send_protected_message(
+                message.chat.id,
+                "🛠️ **Personaliza la calidad de este video**\n\nConfigura la calidad de compresión para este video.\n**Para cambiar de configuración de compresión use /mode**",
+                reply_to_message_id=message.id,
+                reply_markup=keyboard
+            )
+            logger.info(f"✅Video en espera de configuración (modo after) para {user_id}: {compression_id}")
+    else:
+        # ========== USUARIO FREE TIER ==========
+        # Validaciones:
+        # 1. Solo se aceptan videos nativos, no documentos (porque no podemos obtener duración de documento)
+        if not message.video:
+            await send_protected_message(
+                message.chat.id,
+                "El video no cumple con los requisitos establecidos.",
+                reply_to_message_id=message.id
+            )
+            return
+        
+        # 2. Tamaño máximo
+        if message.video.file_size > FREE_VIDEO_MAX_SIZE:
+            await send_protected_message(
+                message.chat.id,
+                "El video no cumple con los requisitos establecidos.",
+                reply_to_message_id=message.id
+            )
+            return
+        
+        # 3. Duración máxima
+        if message.video.duration and message.video.duration > FREE_VIDEO_MAX_DURATION:
+            await send_protected_message(
+                message.chat.id,
+                "El video no cumple con los requisitos establecidos.",
+                reply_to_message_id=message.id
+            )
+            return
+        
+        # 4. Verificar cooldown
+        can_use, msg = await can_use_free_tier(user_id)
+        if not can_use:
+            await send_protected_message(
+                message.chat.id,
+                msg,
+                reply_to_message_id=message.id
+            )
+            return
+        
+        # 5. Límite de cola (1 para free)
+        queue_limit = await get_user_queue_limit(user_id)  # retorna 1 para free
+        pending_count = pending_col.count_documents({"user_id": user_id})
+        downloaded_count = await get_user_downloaded_count(user_id)
+        total_pending = pending_count + downloaded_count
+        if total_pending >= queue_limit:
+            await send_protected_message(
+                message.chat.id,
+                f"Ya tienes {total_pending} video en cola (límite: {queue_limit}).\nPor favor espera a que se procese antes de enviar otro.",
+                reply_to_message_id=message.id
+            )
+            return
+        
+        # Todo OK: mostrar menú de personalización (igual que modo after para pagados)
+        compression_id = generate_compression_id()
+        seq = get_next_pending_seq()
+        pending_col.insert_one({
+            "user_id": user_id,
+            "video_id": getattr(file_obj, 'file_id', None),
+            "file_name": file_name,
+            "chat_id": message.chat.id,
+            "message_id": message.id,
+            "compression_id": compression_id,
+            "timestamp": datetime.datetime.now(),
+            "caption": message.caption,
+            "seq": seq,
+            "status": "awaiting_config",
+            "custom_settings": None,
+            "wait_message_id": None
+        })
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛠️ Personalizar Calidad 🔧", callback_data=f"config_video_{compression_id}")],
+            [InlineKeyboardButton("⚙️ Resolucion ⚙️", callback_data=f"select_resolution_{compression_id}")],
+            [InlineKeyboardButton("⛔ Cancelar ⛔", callback_data=f"vid_cancel_{compression_id}")]
+        ])
+        await send_protected_message(
+            message.chat.id,
+            "🛠️ **Personaliza la calidad de este video**\n\nConfigura la calidad de compresión para este video.",
+            reply_to_message_id=message.id,
+            reply_markup=keyboard
+        )
+        logger.info(f"✅Video free tier en espera de configuración para {user_id}: {compression_id}")
 
 async def enqueue_video_for_compression(compression_id: str, custom_settings: dict):
     pending_item = pending_col.find_one({"compression_id": compression_id})
@@ -2750,7 +2815,7 @@ async def update_payment_status(payment_id: ObjectId, status: str, receipt_photo
 async def delete_payment_request(payment_id: ObjectId):
     pending_payments_col.delete_one({"_id": payment_id})
 
-# ======================== CALLBACK HANDLER MODIFICADO ======================== #
+# ======================== CALLBACK HANDLER ======================== #
 @app.on_callback_query()
 async def callback_handler(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
@@ -2785,7 +2850,6 @@ async def callback_handler(client, callback_query: CallbackQuery):
         await callback_query.answer()
         return
 
-    # ================== NUEVOS BLOQUES PARA SELECCIÓN RÁPIDA DE RESOLUCIÓN ================== #
     if data.startswith("select_resolution_"):
         compression_id = data.split("_")[2]
         pending_item = pending_col.find_one({"compression_id": compression_id})
@@ -2805,8 +2869,7 @@ async def callback_handler(client, callback_query: CallbackQuery):
     if data.startswith("quick_res_"):
         parts = data.split("_")
         compression_id = parts[2]
-        resolution = parts[3]  # '360', '480', '720'
-        # Configuraciones predefinidas
+        resolution = parts[3]
         configs = {
             "360": {"resolution": "640x360", "crf": "28", "fps": "20", "audio_bitrate": "64k"},
             "480": {"resolution": "-2:480", "crf": "30", "fps": "20", "audio_bitrate": "64k"},
@@ -2820,7 +2883,6 @@ async def callback_handler(client, callback_query: CallbackQuery):
         if not pending_item or pending_item.get("status") != "awaiting_config":
             await callback_query.answer("⚠️ Este video ya no está disponible.", show_alert=True)
             return
-        # Encolar con la configuración rápida
         success = await enqueue_video_for_compression(compression_id, custom_settings)
         if success:
             await callback_query.message.edit_text("✅ **Configuración aplicada.**\nEl video se está procesando.")
@@ -2832,7 +2894,7 @@ async def callback_handler(client, callback_query: CallbackQuery):
         return
 
     if data.startswith("back_to_config_"):
-        compression_id = data.split("_")[3]  # back_to_config_{compression_id}
+        compression_id = data.split("_")[3]
         pending_item = pending_col.find_one({"compression_id": compression_id})
         if not pending_item:
             await callback_query.answer("⚠️ Este video ya no está disponible.", show_alert=True)
@@ -2848,7 +2910,6 @@ async def callback_handler(client, callback_query: CallbackQuery):
         )
         await callback_query.answer()
         return
-    # ================== FIN DE LOS NUEVOS BLOQUES ================== #
 
     if data.startswith("vid_res_"):
         parts = data.split("_")
@@ -2865,14 +2926,12 @@ async def callback_handler(client, callback_query: CallbackQuery):
         await callback_query.answer()
         return
 
-    # ----- NUEVO MANEJADOR PARA "🔙 Regresar" en el paso de resolución -----
     if data.startswith("vid_back_res_"):
-        compression_id = data.split("_")[3]  # vid_back_res_{compression_id}
+        compression_id = data.split("_")[3]
         pending_item = pending_col.find_one({"compression_id": compression_id})
         if not pending_item:
             await callback_query.answer("⚠️ Este video ya no está disponible.", show_alert=True)
             return
-        # Volver al menú principal de configuración (igual que en "back_to_config_")
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🛠️ Personalizar Calidad 🔧", callback_data=f"config_video_{compression_id}")],
             [InlineKeyboardButton("⚙️ Resolucion ⚙️", callback_data=f"select_resolution_{compression_id}")],
@@ -2884,7 +2943,6 @@ async def callback_handler(client, callback_query: CallbackQuery):
         )
         await callback_query.answer()
         return
-    # ----------------------------------------------------------
 
     if data.startswith("vid_next_crf_"):
         compression_id = data.split("_")[3]
@@ -3328,7 +3386,6 @@ async def callback_handler(client, callback_query: CallbackQuery):
                 await callback_query.answer("⚠️ No se pudo cancelar la tarea", show_alert=True)
         return
 
-    # ========== NUEVO MANEJADOR PARA REFRESH_QUEUE (opcional, ya no necesario pero se conserva) ==========
     if data == "refresh_queue":
         try:
             queue_text, queue_keyboard = await get_queue_status(user_id)
@@ -3339,16 +3396,13 @@ async def callback_handler(client, callback_query: CallbackQuery):
             await callback_query.answer("⏳Procesando información⏳...")
         return
 
-    # ========== NUEVO MANEJADOR PARA CLOSE_QUEUE ==========
     elif data == "close_queue":
         try:
-            # Cancelar la tarea de actualización si existe
             if user_id in user_queue_tasks:
                 data_task = user_queue_tasks[user_id]
                 data_task["task"].cancel()
                 del user_queue_tasks[user_id]
             await callback_query.message.delete()
-            # Opcional: eliminar también el mensaje anterior (si lo hubiera)
             await callback_query.answer("✅ Mensaje cerrado")
         except Exception as e:
             logger.error(f"Error cerrando mensaje de cola: {e}")
@@ -3773,6 +3827,7 @@ async def handle_payment_capture(client, message: Message):
     except:
         pass
 
+# ======================== COMANDO START MODIFICADO ======================== #
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
     try:
@@ -3784,9 +3839,13 @@ async def start_command(client, message):
             return
         pending_payments_col.delete_many({"user_id": user_id, "status": {"$in": ["awaiting_capture", "waiting_receipt"]}})
         user_plan = await get_user_plan(user_id)
+        
+        # Si el usuario no tiene plan (free)
         if user_plan is None or user_plan.get("plan") is None:
-            await send_denied_access_message(message.chat.id)
+            await send_free_start_message(message.chat.id)
             return
+        
+        # Si tiene plan de pago
         image_path = "logo.jpg"
         caption = ("**🤖 Bot para comprimir videos**\n➣**Creado por** @boyPhonk\n\n"
                    "**¡Bienvenido!** Puedo reducir el tamaño de los vídeos hasta un 80% o más y se verán bien sin perder tanta calidad.\n"
@@ -3796,6 +3855,7 @@ async def start_command(client, message):
     except Exception as e:
         logger.error(f"❌Error en handle_start: {e}", exc_info=True)
 
+# ======================== HANDLER DE MENÚ PRINCIPAL ======================== #
 @app.on_message(filters.text & filters.private)
 async def main_menu_handler(client, message):
     try:
@@ -3806,6 +3866,30 @@ async def main_menu_handler(client, message):
                 return
         if user_id in ban_users:
             return
+        
+        user_plan = await get_user_plan(user_id)
+        # Si es free, solo permitir /planes, /key, /estado, /mode (aunque mode no es tan relevante) y comandos de soporte
+        if user_plan.get("plan") is None:
+            # Solo permitimos /planes y /key, y comandos de ayuda/estado
+            if text == "📋 planes":
+                await planes_command(client, message)
+            elif text == "ℹ️ ayuda":
+                # Mostrar ayuda básica
+                support_keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("👨🏻‍💻 Soporte", url="https://t.me/boyPhonk")]])
+                await send_protected_message(message.chat.id, "👨🏻‍💻 **Información**\n\n➣ **Para comprimir un video**:\n• Envíalo como video nativo (no documento)\n• Límites: 500 MB, 50 min, 1 video cada 48h\n• Personaliza la calidad al enviarlo\n\n➣ **Ver planes**:\n• Usa el botón 📋 Planes\n\n➣ **Usa** /start **para ver el mensaje de bienvenida**\n\n➣ **Para cambiar modo de compresión** (aunque en free siempre es configuración al enviar): /mode", reply_markup=support_keyboard)
+            elif text.startswith("/key"):
+                await key_command(client, message)
+            elif text.startswith("/estado"):
+                await estado_command(client, message)
+            elif text.startswith("/mode"):
+                # Mostrar mensaje informativo
+                await send_protected_message(message.chat.id, "ℹ️ **Modo de compresión**:\nEn la capa gratuita siempre se te pedirá configurar la calidad al enviar el video.\n\nPara cambiar esta configuración, adquiere un plan de pago.")
+            else:
+                # Cualquier otra acción: enviar mensaje de bienvenida free
+                await send_free_start_message(message.chat.id)
+            return
+        
+        # Usuario con plan de pago: comportamiento normal
         if text == "⚙️ settings":
             await settings_menu(client, message)
         elif text == "📋 planes":
@@ -3826,12 +3910,13 @@ async def main_menu_handler(client, message):
     except Exception as e:
         logger.error(f"❌Error en main_menu_handler: {e}", exc_info=True)
 
+# ======================== OTROS COMANDOS ======================== #
 @app.on_message(filters.command("mode") & filters.private)
 async def mode_command(client, message):
     user_id = message.from_user.id
     user_plan = await get_user_plan(user_id)
     if user_plan is None or user_plan.get("plan") is None:
-        await send_denied_access_message(message.chat.id)
+        await send_free_start_message(message.chat.id)
         return
     current_mode = await get_user_compression_mode(user_id)
     mode_text = (
@@ -3994,7 +4079,7 @@ async def my_plan_command(client, message):
         user_id = message.from_user.id
         user_plan = await get_user_plan(user_id)
         if user_plan is None or user_plan.get("plan") is None:
-            await send_denied_access_message(message.chat.id)
+            await send_free_start_message(message.chat.id)
         else:
             plan_info, keyboard = await get_plan_info(user_id)
             await send_protected_message(message.chat.id, plan_info, reply_markup=keyboard)
@@ -4037,16 +4122,21 @@ async def user_info_command(client, message):
         except:
             username = "Sin username"
         if user:
-            plan_name = user["plan"].capitalize() if user.get("plan") else "Ninguno"
+            plan_name = user["plan"].capitalize() if user.get("plan") else "Free"
             join_date = user.get("join_date", "Desconocido")
             expires_at = user.get("expires_at", "No expira")
             compressed_videos = user.get("compressed_videos", 0)
             user_number = user.get("user_number", "N/A")
+            last_free_use = user.get("last_free_use_time")
             if isinstance(join_date, datetime.datetime):
                 join_date = join_date.strftime("%Y-%m-%d %H:%M:%S")
             if isinstance(expires_at, datetime.datetime):
                 expires_at = expires_at.strftime("%Y-%m-%d %H:%M:%S")
-            await message.reply(f"👤**Usuario**: {username}\n🆔 **ID**: `{user_id}`\n🔢 **Número**: {user_number}\n📝 **Plan**: {plan_name}\n🎬 **Videos comprimidos**: {compressed_videos}\n📅 **Fecha de registro**: {join_date}\n⏰ **Expira**: {expires_at}")
+            if isinstance(last_free_use, datetime.datetime):
+                last_free_use = last_free_use.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                last_free_use = "Nunca"
+            await message.reply(f"👤**Usuario**: {username}\n🆔 **ID**: `{user_id}`\n🔢 **Número**: {user_number}\n📝 **Plan**: {plan_name}\n🎬 **Videos comprimidos**: {compressed_videos}\n📅 **Fecha de registro**: {join_date}\n⏰ **Expira**: {expires_at}\n🆓 **Último uso free**: {last_free_use}")
         else:
             await message.reply("⚠️ Usuario no registrado o sin plan")
     except Exception as e:
@@ -4075,7 +4165,7 @@ async def list_users_command(client, message):
         response = "**Lista de Usuarios Registrados**\n\n"
         for user in all_users:
             user_id = user["user_id"]
-            plan = user["plan"].capitalize() if user.get("plan") else "Ninguno"
+            plan = user["plan"].capitalize() if user.get("plan") else "Free"
             user_number = user.get("user_number", "?")
             try:
                 user_info = await app.get_users(user_id)
@@ -4261,12 +4351,11 @@ async def queue_command(client, message):
     user_id = message.from_user.id
     user_plan = await get_user_plan(user_id)
     if user_plan is None or user_plan.get("plan") is None:
-        await send_denied_access_message(message.chat.id)
+        await send_free_start_message(message.chat.id)
         return
 
     queue_status, keyboard = await get_queue_status(user_id)
 
-    # Si ya hay un mensaje de cola para este usuario, cancelar tarea y eliminar mensaje anterior
     if user_id in user_queue_tasks:
         data = user_queue_tasks[user_id]
         data["task"].cancel()
@@ -4276,12 +4365,10 @@ async def queue_command(client, message):
             logger.error(f"Error eliminando mensaje de cola anterior: {e}")
         del user_queue_tasks[user_id]
 
-    # Enviar mensaje nuevo
     msg = await send_protected_message(message.chat.id, queue_status, reply_markup=keyboard)
     chat_id = msg.chat.id
     message_id = msg.id
 
-    # Crear la tarea de actualización
     task = asyncio.create_task(update_queue_loop(chat_id, message_id, user_id))
     user_queue_tasks[user_id] = {
         "chat_id": chat_id,
@@ -4393,7 +4480,7 @@ async def calidad_command(client, message):
         user_id = message.from_user.id
         user_plan = await get_user_plan(user_id)
         if user_plan is None or user_plan.get("plan") is None:
-            await send_denied_access_message(message.chat.id)
+            await send_free_start_message(message.chat.id)
             return
         if len(message.text.split()) < 2:
             current_settings = await get_user_video_settings(user_id)
@@ -4457,11 +4544,20 @@ async def handle_document_video(client, message: Message):
             mime = doc.mime_type or ""
             if not mime.startswith('video/'):
                 await send_protected_message(
-    message.chat.id,
-    f"❌ **Formato no soportado.**\nExtensiones válidas: {', '.join(SUPPORTED_VIDEO_EXTENSIONS)}",
-    reply_to_message_id=message.id
-)
+                    message.chat.id,
+                    f"❌ **Formato no soportado.**\nExtensiones válidas: {', '.join(SUPPORTED_VIDEO_EXTENSIONS)}",
+                    reply_to_message_id=message.id
+                )
                 return
+        # Solo permitimos documentos para usuarios con plan de pago; los free solo pueden enviar video nativo
+        user_plan = await get_user_plan(user_id)
+        if user_plan.get("plan") is None:
+            await send_protected_message(
+                message.chat.id,
+                "El video no cumple con los requisitos establecidos.",
+                reply_to_message_id=message.id
+            )
+            return
         await process_media_file(client, message, doc, file_name)
         logger.info(f"✅Documento de vídeo procesado automáticamente para {user_id}: {file_name}")
     except Exception as e:
@@ -4757,7 +4853,7 @@ async def main():
     asyncio.create_task(watchdog_loop())
     asyncio.create_task(send_log_periodically())
     asyncio.create_task(expiry_check_loop())
-    asyncio.create_task(update_compression_waiting_messages_loop())  # Actualiza cada 5 min
+    asyncio.create_task(update_compression_waiting_messages_loop())
     await app.start()
     bot_info = await app.get_me()
     logger.info(f"🌐Bot iniciado: @{bot_info.username}🌐")
